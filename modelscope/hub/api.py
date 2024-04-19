@@ -15,7 +15,9 @@ from http import HTTPStatus
 from http.cookiejar import CookieJar
 from os.path import expanduser
 from typing import Dict, List, Optional, Tuple, Union
+from urllib.parse import urlencode
 
+import json
 import pandas as pd
 import requests
 from requests import Session
@@ -31,7 +33,8 @@ from modelscope.hub.constants import (API_HTTP_CLIENT_TIMEOUT,
                                       MODELSCOPE_CLOUD_ENVIRONMENT,
                                       MODELSCOPE_CLOUD_USERNAME,
                                       MODELSCOPE_REQUEST_ID, ONE_YEAR_SECONDS,
-                                      REQUESTS_API_HTTP_METHOD, Licenses,
+                                      REQUESTS_API_HTTP_METHOD,
+                                      DatasetVisibility, Licenses,
                                       ModelVisibility)
 from modelscope.hub.errors import (InvalidParameter, NotExistError,
                                    NotLoginException, NoValidRevisionError,
@@ -439,6 +442,30 @@ class HubApi:
         Returns:
             Tuple[List[str], List[str]]: Return list of branch name and tags
         """
+        tags_details = self.list_model_revisions_detail(model_id=model_id,
+                                                        cutoff_timestamp=cutoff_timestamp,
+                                                        use_cookies=use_cookies)
+        tags = [x['Revision'] for x in tags_details
+                ] if tags_details else []
+        return tags
+
+    def list_model_revisions_detail(
+            self,
+            model_id: str,
+            cutoff_timestamp: Optional[int] = None,
+            use_cookies: Union[bool, CookieJar] = False) -> List[str]:
+        """Get model branch and tags.
+
+        Args:
+            model_id (str): The model id
+            cutoff_timestamp (int): Tags created before the cutoff will be included.
+                                    The timestamp is represented by the seconds elapsed from the epoch time.
+            use_cookies (Union[bool, CookieJar], optional): If is cookieJar, we will use this cookie, if True,
+                        will load cookie from local. Defaults to False.
+
+        Returns:
+            Tuple[List[str], List[str]]: Return list of branch name and tags
+        """
         cookies = self._check_cookie(use_cookies)
         if cutoff_timestamp is None:
             cutoff_timestamp = get_release_datetime()
@@ -450,66 +477,84 @@ class HubApi:
         raise_on_error(d)
         info = d[API_RESPONSE_FIELD_DATA]
         # tags returned from backend are guaranteed to be ordered by create-time
-        tags = [x['Revision'] for x in info['RevisionMap']['Tags']
-                ] if info['RevisionMap']['Tags'] else []
-        return tags
+        return info['RevisionMap']['Tags']
 
-    def get_valid_revision(self,
-                           model_id: str,
-                           revision=None,
-                           cookies: Optional[CookieJar] = None):
+    def get_branch_tag_detail(self, details, name):
+        for item in details:
+            if item['Revision'] == name:
+                return item
+        return None
+
+    def get_valid_revision_detail(self,
+                                  model_id: str,
+                                  revision=None,
+                                  cookies: Optional[CookieJar] = None):
         release_timestamp = get_release_datetime()
         current_timestamp = int(round(datetime.datetime.now().timestamp()))
         # for active development in library codes (non-release-branches), release_timestamp
         # is set to be a far-away-time-in-the-future, to ensure that we shall
         # get the master-HEAD version from model repo by default (when no revision is provided)
+        all_branches_detail, all_tags_detail = self.get_model_branches_and_tags_details(
+            model_id, use_cookies=False if cookies is None else cookies)
+        all_branches = [x['Revision'] for x in all_branches_detail] if all_branches_detail else []
+        all_tags = [x['Revision'] for x in all_tags_detail] if all_tags_detail else []
         if release_timestamp > current_timestamp + ONE_YEAR_SECONDS:
-            branches, tags = self.get_model_branches_and_tags(
-                model_id, use_cookies=False if cookies is None else cookies)
             if revision is None:
                 revision = MASTER_MODEL_BRANCH
                 logger.info(
                     'Model revision not specified, use default: %s in development mode'
                     % revision)
-            if revision not in branches and revision not in tags:
+            if revision not in all_branches and revision not in all_tags:
                 raise NotExistError('The model: %s has no revision : %s .' % (model_id, revision))
+
+            revision_detail = self.get_branch_tag_detail(all_tags_detail, revision)
+            if revision_detail is None:
+                revision_detail = self.get_branch_tag_detail(all_branches_detail, revision)
             logger.info('Development mode use revision: %s' % revision)
         else:
-            all_revisions = self.list_model_revisions(
-                model_id,
-                cutoff_timestamp=current_timestamp,
-                use_cookies=False if cookies is None else cookies)
-            if len(all_revisions) == 0:
+            if len(all_tags_detail) == 0:  # use no revision use master as default.
                 if revision is None or revision == MASTER_MODEL_BRANCH:
                     revision = MASTER_MODEL_BRANCH
                 else:
                     raise NotExistError('The model: %s has no revision: %s !' % (model_id, revision))
+                revision_detail = self.get_branch_tag_detail(all_branches_detail, revision)
             else:
                 if revision is None:  # user not specified revision, use latest revision before release time
-                    revisions = self.list_model_revisions(
-                        model_id,
-                        cutoff_timestamp=release_timestamp,
-                        use_cookies=False if cookies is None else cookies)
-                    if len(revisions) > 0:
-                        revision = revisions[0]  # use latest revision before release time.
+                    revisions_detail = [x for x in
+                                        all_tags_detail if x['CreatedAt'] <= release_timestamp] if all_tags_detail else [] # noqa E501
+                    if len(revisions_detail) > 0:
+                        revision = revisions_detail[0]['Revision']  # use latest revision before release time.
+                        revision_detail = revisions_detail[0]
                     else:
                         revision = MASTER_MODEL_BRANCH
-                        vl = '[%s]' % ','.join(all_revisions)
+                        revision_detail = self.get_branch_tag_detail(all_branches_detail, revision)
+                        vl = '[%s]' % ','.join(all_tags)
                         logger.warning('Model revision should be specified from revisions: %s' % (vl))
                     logger.warning('Model revision not specified, use revision: %s' % revision)
                 else:
                     # use user-specified revision
-                    if revision not in all_revisions:
+                    if revision not in all_tags:
                         if revision == MASTER_MODEL_BRANCH:
                             logger.warning('Using the master branch is fragile, please use it with caution!')
+                            revision_detail = self.get_branch_tag_detail(all_branches_detail, revision)
                         else:
-                            vl = '[%s]' % ','.join(all_revisions)
+                            vl = '[%s]' % ','.join(all_tags)
                             raise NotExistError('The model: %s has no revision: %s valid are: %s!' %
                                                 (model_id, revision, vl))
+                    else:
+                        revision_detail = self.get_branch_tag_detail(all_tags_detail, revision)
                     logger.info('Use user-specified model revision: %s' % revision)
-        return revision
+        return revision_detail
 
-    def get_model_branches_and_tags(
+    def get_valid_revision(self,
+                           model_id: str,
+                           revision=None,
+                           cookies: Optional[CookieJar] = None):
+        return self.get_valid_revision_detail(model_id=model_id,
+                                              revision=revision,
+                                              cookies=cookies)['Revision']
+
+    def get_model_branches_and_tags_details(
         self,
         model_id: str,
         use_cookies: Union[bool, CookieJar] = False,
@@ -533,10 +578,29 @@ class HubApi:
         d = r.json()
         raise_on_error(d)
         info = d[API_RESPONSE_FIELD_DATA]
-        branches = [x['Revision'] for x in info['RevisionMap']['Branches']
-                    ] if info['RevisionMap']['Branches'] else []
-        tags = [x['Revision'] for x in info['RevisionMap']['Tags']
-                ] if info['RevisionMap']['Tags'] else []
+        return info['RevisionMap']['Branches'], info['RevisionMap']['Tags']
+
+    def get_model_branches_and_tags(
+        self,
+        model_id: str,
+        use_cookies: Union[bool, CookieJar] = False,
+    ) -> Tuple[List[str], List[str]]:
+        """Get model branch and tags.
+
+        Args:
+            model_id (str): The model id
+            use_cookies (Union[bool, CookieJar], optional): If is cookieJar, we will use this cookie, if True,
+                        will load cookie from local. Defaults to False.
+
+        Returns:
+            Tuple[List[str], List[str]]: Return list of branch name and tags
+        """
+        branches_detail, tags_detail = self.get_model_branches_and_tags_details(model_id=model_id,
+                                                                                use_cookies=use_cookies)
+        branches = [x['Revision'] for x in branches_detail
+                    ] if branches_detail else []
+        tags = [x['Revision'] for x in tags_detail
+                ] if tags_detail else []
         return branches, tags
 
     def get_model_files(self,
@@ -586,6 +650,44 @@ class HubApi:
             files.append(file)
         return files
 
+    def create_dataset(self,
+                       dataset_name: str,
+                       namespace: str,
+                       chinese_name: Optional[str] = '',
+                       license: Optional[str] = Licenses.APACHE_V2,
+                       visibility: Optional[int] = DatasetVisibility.PUBLIC,
+                       description: Optional[str] = '') -> str:
+
+        if dataset_name is None or namespace is None:
+            raise InvalidParameter('dataset_name and namespace are required!')
+
+        cookies = ModelScopeConfig.get_cookies()
+        if cookies is None:
+            raise ValueError('Token does not exist, please login first.')
+
+        path = f'{self.endpoint}/api/v1/datasets'
+        files = {
+            'Name': (None, dataset_name),
+            'ChineseName': (None, chinese_name),
+            'Owner': (None, namespace),
+            'License': (None, license),
+            'Visibility': (None, visibility),
+            'Description': (None, description)
+        }
+
+        r = self.session.post(
+            path,
+            files=files,
+            cookies=cookies,
+            headers=self.builder_headers(self.headers),
+        )
+
+        handle_http_post_error(r, path, files)
+        raise_on_error(r.json())
+        dataset_repo_url = f'{self.endpoint}/datasets/{namespace}/{dataset_name}'
+        logger.info(f'Create dataset success: {dataset_repo_url}')
+        return dataset_repo_url
+
     def list_datasets(self):
         path = f'{self.endpoint}/api/v1/datasets'
         params = {}
@@ -605,6 +707,47 @@ class HubApi:
         dataset_id = resp['Data']['Id']
         dataset_type = resp['Data']['Type']
         return dataset_id, dataset_type
+
+    def get_dataset_infos(self,
+                          dataset_hub_id: str,
+                          revision: str,
+                          files_metadata: bool = False,
+                          timeout: float = 100,
+                          recursive: str = 'True'):
+        """
+        Get dataset infos.
+        """
+        datahub_url = f'{self.endpoint}/api/v1/datasets/{dataset_hub_id}/repo/tree'
+        params = {'Revision': revision, 'Root': None, 'Recursive': recursive}
+        cookies = ModelScopeConfig.get_cookies()
+        if files_metadata:
+            params['blobs'] = True
+        r = self.session.get(datahub_url, params=params, cookies=cookies, timeout=timeout)
+        resp = r.json()
+        datahub_raise_on_error(datahub_url, resp, r)
+
+        return resp
+
+    def list_repo_tree(self,
+                       dataset_name: str,
+                       namespace: str,
+                       revision: str,
+                       root_path: str,
+                       recursive: bool = True):
+
+        dataset_hub_id, dataset_type = self.get_dataset_id_and_type(
+            dataset_name=dataset_name, namespace=namespace)
+
+        recursive = 'True' if recursive else 'False'
+        datahub_url = f'{self.endpoint}/api/v1/datasets/{dataset_hub_id}/repo/tree'
+        params = {'Revision': revision, 'Root': root_path, 'Recursive': recursive}
+        cookies = ModelScopeConfig.get_cookies()
+
+        r = self.session.get(datahub_url, params=params, cookies=cookies)
+        resp = r.json()
+        datahub_raise_on_error(datahub_url, resp, r)
+
+        return resp
 
     def get_dataset_meta_file_list(self, dataset_name: str, namespace: str, dataset_id: str, revision: str):
         """ Get the meta file-list of the dataset. """
@@ -674,7 +817,6 @@ class HubApi:
         Fetch the meta-data files from the url, e.g. csv/jsonl files.
         """
         import hashlib
-        import json
         from tqdm import tqdm
         out_path = os.path.join(out_path, hashlib.md5(url.encode(encoding='UTF-8')).hexdigest())
         if mode == DownloadMode.FORCE_REDOWNLOAD and os.path.exists(out_path):
@@ -713,7 +855,7 @@ class HubApi:
                     else:
                         with_header = False
                     chunk_df = pd.DataFrame(chunk)
-                    chunk_df.to_csv(f, index=False, header=with_header)
+                    chunk_df.to_csv(f, index=False, header=with_header, escapechar='\\')
                     iter_num += 1
                 else:
                     # csv or others
@@ -724,6 +866,34 @@ class HubApi:
         return out_path
 
     def get_dataset_file_url(
+            self,
+            file_name: str,
+            dataset_name: str,
+            namespace: str,
+            revision: Optional[str] = DEFAULT_DATASET_REVISION,
+            extension_filter: Optional[bool] = True):
+
+        if not file_name or not dataset_name or not namespace:
+            raise ValueError('Args (file_name, dataset_name, namespace) cannot be empty!')
+
+        # Note: make sure the FilePath is the last parameter in the url
+        params: dict = {'Source': 'SDK', 'Revision': revision, 'FilePath': file_name}
+        params: str = urlencode(params)
+        file_url = f'{self.endpoint}/api/v1/datasets/{namespace}/{dataset_name}/repo?{params}'
+
+        return file_url
+
+        # if extension_filter:
+        #     if os.path.splitext(file_name)[-1] in META_FILES_FORMAT:
+        #         file_url = f'{self.endpoint}/api/v1/datasets/{namespace}/{dataset_name}/repo?'\
+        #                    f'Revision={revision}&FilePath={file_name}'
+        #     else:
+        #         file_url = file_name
+        #     return file_url
+        # else:
+        #     return file_url
+
+    def get_dataset_file_url_origin(
             self,
             file_name: str,
             dataset_name: str,
@@ -870,7 +1040,7 @@ class HubApi:
         datahub_raise_on_error(url, resp, r)
         return resp['Data']
 
-    def dataset_download_statistics(self, dataset_name: str, namespace: str, use_streaming: bool) -> None:
+    def dataset_download_statistics(self, dataset_name: str, namespace: str, use_streaming: bool = False) -> None:
         is_ci_test = os.getenv('CI_TEST') == 'True'
         if dataset_name and namespace and not is_ci_test and not use_streaming:
             try:
@@ -902,6 +1072,10 @@ class HubApi:
     def builder_headers(self, headers):
         return {MODELSCOPE_REQUEST_ID: str(uuid.uuid4().hex),
                 **headers}
+
+    def get_file_base_path(self, namespace: str, dataset_name: str) -> str:
+        return f'{self.endpoint}/api/v1/datasets/{namespace}/{dataset_name}/repo?'
+        # return f'{endpoint}/api/v1/datasets/{namespace}/{dataset_name}/repo?Revision={revision}&FilePath='
 
 
 class ModelScopeConfig:
